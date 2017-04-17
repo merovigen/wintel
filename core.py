@@ -1,12 +1,19 @@
 import gammu
 import time
-from peewee import SqliteDatabase, Model, IntegerField, TextField, IntegrityError
+from peewee import SqliteDatabase, Model, IntegerField, TextField, IntegrityError, DoesNotExist
+from collections import OrderedDict
 import os
 import flock
+import click
+import re
+import logging
 
 # TODO test locking
 
 db = SqliteDatabase('/var/db/sms.db')
+logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s',
+                    level=logging.INFO,
+                    filename='/var/log/wintel.log')
 
 
 class Message(Model):
@@ -23,9 +30,29 @@ class Number(Model):
     description = TextField()
     imsi = IntegerField(unique=True, primary_key=True)
     number = IntegerField(unique=True)
+    cid = TextField()
 
     class Meta:
         database = db
+
+
+class UnSortedGroup(click.Group):
+    def __init__(self, *args, **kwargs):
+        super(UnSortedGroup, self).__init__(*args, **kwargs)
+        self.commands = OrderedDict()
+
+    def list_commands(self, ctx):
+        return self.commands
+
+
+def group(name=None, **attrs):
+    attrs.setdefault('cls', UnSortedGroup)
+    return click.command(name, **attrs)
+
+
+@group()
+def cli():
+    pass
 
 
 def init(config_path=None):
@@ -35,22 +62,58 @@ def init(config_path=None):
     return state_machine
 
 
-def modem_show():
-    pass
+@cli.command()
+@click.option('--imsi', type=click.STRING, required=True, help="Modem IMSI", show_default=True)
+def modem_show(imsi):
+    try:
+        modem = Number.get(imsi=imsi)
+    except DoesNotExist:
+        logging.error('No modem with IMSI {}'.format(imsi))
+        print 'Error: no modem with IMSI {}'.format(imsi)
+    else:
+        print 'IMSI: {}\n' \
+              'Number: +7 {}\n' \
+              'Description: {}\n' \
+              'Last CID: {}'.format(modem.imsi, modem.number, modem.description, modem.cid)
 
 
+@cli.command()
+@click.option('--imsi', type=click.STRING, required=True, help="Modem IMSI", show_default=True)
+@click.option('--number', type=click.STRING, required=True, help="Modem number", show_default=True)
+@click.option('--description', type=click.STRING, required=False, help="Description", show_default=True)
 def modem_add(imsi, number, description):
-    pass
+    try:
+        Number.get(imsi=imsi)
+    except DoesNotExist:
+        Number.create(imsi=imsi, number=number, description=description, cid=0)
+        logging.info('Added modem, IMSI: {}, number: {}, description: {}'.format(imsi, number, description))
+    else:
+        logging.error('Error: modem with this IMSI already exist')
+        print 'Modem with this IMSI already exist'
 
 
+@cli.command()
+@click.option('--imsi', type=click.STRING, required=True, help="User login", show_default=True)
 def modem_delete(imsi):
-    pass
+    try:
+        modem = Number.get(imsi=imsi)
+    except DoesNotExist:
+        logging.error('No modem with IMSI {}'.format(imsi))
+        print 'Error: no modem with IMSI {}'.format(imsi)
+    else:
+        modem.delete_instance()
+        logging.info('Deleted modem, IMSI: {}'.format(imsi))
 
 
 def __system_scan():
     # Scans /dev for ttyUSB devices and returns absolute paths list for config generation
     # eg ['/dev/ttyUSB0', /dev/'ttyUSB2']
-    return ['/dev/ttyUSB0']
+    modem_list = []
+    for dev in os.listdir('/dev'):
+        if 'ttyUSB' in dev and int(re.search(r'ttyUSB(.*)', dev).group(1)) % 2 == 0:
+            modem_list.append('/dev/'+dev)
+    return modem_list
+    # return ['/dev/ttyUSB0']
 
 
 def __generate_gammu_config(modem_path):
@@ -92,12 +155,13 @@ def get_all_sms(state_machine):
             start = False
         else:
             cursms = state_machine.GetNextSMS(Location=cursms[0]['Location'], Folder=0)
-        message_number = message_number - len(cursms)
+        message_number -= len(cursms)
         sms_list.append(cursms)
     return sms_list
 
 
-def main():
+@cli.command()
+def sms():
     with open('/tmp/wintel.lock', 'w') as f:
         with flock.Flock(f, flock.LOCK_EX):
             try:
@@ -114,7 +178,15 @@ def main():
                                            sender=sms['Number'].encode('utf-8'),
                                            content=sms['Text'].encode('utf-8')
                                            )
+                            logging.info('Added message, IMSI: {}, timestamp: {}, sender: {}, content: {}'.format(
+                                imsi,
+                                sms['DateTime'],
+                                sms['Number'].encode('utf-8'),
+                                sms['Text'].encode('utf-8')
+                            ))
                         except IntegrityError:
+                            logging.error("Tried to add duplicate message to database with timestamp {}".format(
+                                int(time.mktime(sms['DateTime'].timetuple()))))
                             print "Tried to add duplicate message to database with timestamp {}".format(
                                 int(time.mktime(sms['DateTime'].timetuple()))
                             )
@@ -126,9 +198,34 @@ def main():
                     # delete temp config file
                     os.remove(config_path)
             except IOError:
-                print 'Lock exists, previous run might be working, exiting now.'
-                return
+                logging.warning('Lock exists, previous run might be working, exiting.')
+                print 'Lock exists, previous run might be working, exiting.'
 
+
+@cli.command()
+def update_cid():
+    for modem_path in __system_scan():
+        config_path = __generate_gammu_config(modem_path)
+        state_machine = init(config_path)
+        imsi = int(state_machine.GetSIMIMSI())
+        network_info = state_machine.GetNetworkInfo()
+        try:
+            modem = Number.get(imsi=imsi)
+        except DoesNotExist:
+            logging.warning('Modem with IMSI {} is not in database!'.format(imsi))
+        else:
+            last_cid = modem.cid
+            if modem.cid != network_info['CID']:
+                modem.cid = network_info['CID']
+                modem.save()
+                logging.info('CID changed to {} from {} for modem with IMSI {}'.format(
+                    network_info['CID'],
+                    last_cid,
+                    imsi))
+
+
+def main():
+    cli()
 
 
 if __name__ == '__main__':
