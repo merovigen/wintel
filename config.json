@@ -1,0 +1,6 @@
+{
+  "log_file_path": "wintel.log",
+  "db_file_path": "sms.db",
+  "tmp_config_dir": ".",
+  "delete_messages": true
+}

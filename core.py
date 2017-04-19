@@ -7,13 +7,17 @@ import flock
 import click
 import re
 import logging
+import json
 
 # TODO test locking
 
-db = SqliteDatabase('/var/db/sms.db')
+with open('config.json') as f:
+    config = json.load(f)
+
+db = SqliteDatabase(config['db_file_path'].encode('utf8'))
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s',
                     level=logging.INFO,
-                    filename='/var/log/wintel.log')
+                    filename=config['log_file_path'].encode('utf8'))
 
 
 class Message(Model):
@@ -118,7 +122,7 @@ def __system_scan():
 
 def __generate_gammu_config(modem_path):
     # generate temp config file for each modem and returns system absolute path, eg /var/conf/$id.conf
-    config_path = '/var/tmp/gammu.conf'
+    config_path = '{}/gammu.conf'.format(config['tmp_config_dir'].encode('utf8'))
     with open(config_path, 'w') as f:
         f.write("""[gammu]
 port = {}
@@ -141,7 +145,7 @@ def __logger(message):
     pass
 
 
-def get_all_sms(state_machine):
+def read_sms_by_modem(state_machine):
     status = state_machine.GetSMSStatus()
 
     message_number = status['SIMUsed'] + status['PhoneUsed'] + status['TemplatesUsed']
@@ -161,40 +165,38 @@ def get_all_sms(state_machine):
 
 
 @cli.command()
-def sms():
-    with open('/tmp/wintel.lock', 'w') as f:
-        with flock.Flock(f, flock.LOCK_EX):
+def read_sms():
+    with open('/tmp/wintel.lock', 'w') as lock:
+        with flock.Flock(lock, flock.LOCK_EX):
             try:
                 # First, we must do a system scan and find all modems
                 for modem_path in __system_scan():
                     config_path = __generate_gammu_config(modem_path)
                     state_machine = init(config_path)
                     imsi = int(state_machine.GetSIMIMSI())
-                    for sms in get_all_sms(state_machine):
-                        sms = sms[0]
+                    for message in read_sms_by_modem(state_machine):
+                        message = message[0]
                         try:
                             Message.create(imsi=imsi,
-                                           timestamp=int(time.mktime(sms['DateTime'].timetuple())),
-                                           sender=sms['Number'].encode('utf-8'),
-                                           content=sms['Text'].encode('utf-8')
+                                           timestamp=int(time.mktime(message['DateTime'].timetuple())),
+                                           sender=message['Number'].encode('utf-8'),
+                                           content=message['Text'].encode('utf-8')
                                            )
                             logging.info('Added message, IMSI: {}, timestamp: {}, sender: {}, content: {}'.format(
                                 imsi,
-                                sms['DateTime'],
-                                sms['Number'].encode('utf-8'),
-                                sms['Text'].encode('utf-8')
+                                message['DateTime'],
+                                message['Number'].encode('utf-8'),
+                                message['Text'].encode('utf-8')
                             ))
                         except IntegrityError:
                             logging.error("Tried to add duplicate message to database with timestamp {}".format(
-                                int(time.mktime(sms['DateTime'].timetuple()))))
+                                message['DateTime']))
                             print "Tried to add duplicate message to database with timestamp {}".format(
-                                int(time.mktime(sms['DateTime'].timetuple()))
-                            )
-                            break
+                                message['DateTime'])
                         # delete message from modem
                         else:
-                            pass
-                            # state_machine.DeleteSMS(0, sms['Location'])
+                            if config['delete_messages']:
+                                state_machine.DeleteSMS(0, message['Location'])
                     # delete temp config file
                     os.remove(config_path)
             except IOError:
@@ -214,7 +216,7 @@ def update_cid():
         except DoesNotExist:
             logging.warning('Modem with IMSI {} is not in database!'.format(imsi))
         else:
-            last_cid = modem.cid
+            last_cid = modem.cid if modem.cid else '0'
             if modem.cid != network_info['CID']:
                 modem.cid = network_info['CID']
                 modem.save()
@@ -230,4 +232,6 @@ def main():
 
 if __name__ == '__main__':
     db.connect()
+    db.create_tables([Message, Number], safe=True)
     main()
+    db.close()
