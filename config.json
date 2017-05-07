@@ -3,5 +3,6 @@
   "db_file_path": "sms.db",
   "tmp_config_dir": ".",
   "delete_messages": true,
-  "web_address": "0.0.0.0"
+  "web_address": "0.0.0.0",
+  "paranoid_mode": false
 }
