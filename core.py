@@ -1,3 +1,4 @@
+import serial
 import gammu
 import time
 from peewee import SqliteDatabase, Model, IntegerField, TextField, IntegrityError, DoesNotExist
@@ -5,7 +6,6 @@ from collections import OrderedDict
 import os
 import flock
 import click
-import re
 import logging
 import json
 import datetime
@@ -28,7 +28,8 @@ state_machine_list = []
 
 
 class Message(Model):
-    timestamp = IntegerField(unique=True, primary_key=True)
+    id = IntegerField(primary_key=True)
+    timestamp = IntegerField()
     imsi = IntegerField()
     sender = TextField()
     content = TextField()
@@ -140,23 +141,40 @@ def sim_delete(imsi):
 
 
 def __system_scan():
-    # Scans /dev for ttyUSB devices and returns absolute paths list for config generation
-    # eg ['/dev/ttyUSB0', /dev/'ttyUSB2']
-    modem_list = []
+    # Scans /dev for ttyUSB devices, check modem answers and returns relative paths list for config generation
+    # modem_list = []
+    # for dev in os.listdir('/dev'):
+    #     if 'ttyUSB' in dev and int(re.search(r'ttyUSB(.*)', dev).group(1)) % 2 == 0:
+    #         modem_list.append('/dev/'+dev)
+    # return modem_list
+    modem_dict = {}
     for dev in os.listdir('/dev'):
-        if 'ttyUSB' in dev and int(re.search(r'ttyUSB(.*)', dev).group(1)) % 2 == 0:
-            modem_list.append('/dev/'+dev)
-    return modem_list
-    # return ['/dev/ttyUSB0', '/dev/ttyUSB2']
+        if 'ttyUSB' in dev:
+            serial_port = serial.Serial(port='/dev/{}'.format(dev), baudrate=115200, bytesize=8, parity='N', stopbits=1,
+                                        timeout=1, rtscts=False, dsrdtr=False)
+            serial_port.write("AT\r\n")
+            ans = serial_port.readlines()
+            if 'OK\r\n' in ans:
+                # just in case
+                serial_port.flushInput()
+                serial_port.write("AT+CGSN\r\n")
+                answer = serial_port.readlines()
+                if len(answer) <= 1:
+                    continue
+                else:
+                    imei = answer[1].strip()
+                    modem_dict[imei] = dev
+    logging.info('Modem scan complete')
+    return modem_dict.values()
+    # return ['ttyUSB0', 'ttyUSB2']
 
 
 def __generate_gammu_config(modem_path):
     # generate temp config file for each modem and returns system absolute path, eg /var/conf/$id.conf
-    gammu_config_path = '{}/gammu_{}.conf'.format(config['tmp_config_dir'].encode('utf8'),
-                                            re.search('/dev/(.*)', modem_path).group(1))
+    gammu_config_path = '{}/gammu_{}.conf'.format(config['tmp_config_dir'].encode('utf8'), modem_path)
     with open(gammu_config_path, 'w') as f:
         f.write("""[gammu]
-port = {}
+port = /dev/{}
 connection = at115200
 synchronizetime = yes
 logformat = errorsdate
@@ -226,8 +244,8 @@ def read_sms():
                                 message['Text'].encode('utf-8')
                             ))
                         except IntegrityError:
-                            logging.error("Tried to add duplicate message to database with timestamp {}".format(
-                                message['DateTime']))
+                            logging.error("Tried to add duplicate message to database with timestamp {} and message {}".format(
+                                message['DateTime'], message['Text'].encode('utf-8')))
                             print "Tried to add duplicate message to database with timestamp {}".format(
                                 message['DateTime'])
                         # delete message from modem
@@ -240,31 +258,36 @@ def read_sms():
             except IOError:
                 logging.warning('Lock exists, previous run might be working, exiting.')
                 print 'Lock exists, previous run might be working, exiting.'
+            except gammu.ERR_TIMEOUT:
+                pass
 
 
 @app.route('/cid')
 def update_cid():
     for state_machine in state_machine_list:
-        imsi = int(state_machine.GetSIMIMSI())
-        network_info = state_machine.GetNetworkInfo()
         try:
-            modem = Number.get(imsi=imsi)
-        except DoesNotExist:
-            logging.warning('Modem with IMSI {} is not in database, adding to database!'.format(imsi))
-            Number.create(imsi=imsi, number=0, description='', cid=network_info['CID'])
-        else:
-            last_cid = modem.cid if modem.cid else '0'
-            if modem.cid != network_info['CID']:
-                modem.cid = network_info['CID']
-                modem.save()
-                logging.info('CID changed to {} from {} for modem with IMSI {}'.format(
-                    network_info['CID'],
-                    last_cid,
-                    imsi))
-                if config['paranoid_mode']:
-                    disable_modem(state_machine)
-                    state_machine_list.remove(state_machine)
-                    logging.warning('Paranoid mode on, disabled modem with IMSI {}!'.format(imsi))
+            imsi = int(state_machine.GetSIMIMSI())
+            network_info = state_machine.GetNetworkInfo()
+            try:
+                modem = Number.get(imsi=imsi)
+            except DoesNotExist:
+                logging.warning('Modem with IMSI {} is not in database, adding to database!'.format(imsi))
+                Number.create(imsi=imsi, number=0, description='', cid=network_info['CID'])
+            else:
+                last_cid = modem.cid if modem.cid else '0'
+                if modem.cid != network_info['CID']:
+                    modem.cid = network_info['CID']
+                    modem.save()
+                    logging.info('CID changed to {} from {} for modem with IMSI {}'.format(
+                        network_info['CID'],
+                        last_cid,
+                        imsi))
+                    if config['paranoid_mode']:
+                        disable_modem(state_machine)
+                        state_machine_list.remove(state_machine)
+                        logging.warning('Paranoid mode on, disabled modem with IMSI {}!'.format(imsi))
+        except gammu.ERR_TIMEOUT:
+            pass
     # flask require callable object to be returned
     return ''
 
@@ -282,27 +305,69 @@ def web():
     app.run(host=config['web_address'])
     logging.info('Application stopped')
     # post cleanup, delete all config
-    for gammu_file in glob.glob('{}/*.conf'.format(config['tmp_config_dir'])):
+    for gammu_file in glob.glob('{}/gammu_*.conf'.format(config['tmp_config_dir'])):
         os.remove(gammu_file)
 
 
 @app.after_request
 def treat_as_plain_text(response):
-    response.headers["content-type"] = "text/plain"
+    response.headers["content-type"] = "text/plain; charset=utf-8"
     return response
 
 
 @app.route('/sms')
-def test():
+def sms():
     read_sms()
     messages = ''
-    for message in Message.select(Message, Number).join(Number, on=(Message.imsi == Number.imsi).alias('num')).order_by(Message.timestamp.desc()):
-        messages += '{} [{}] +7{} | \n'.format(message.sender, datetime.datetime.fromtimestamp(message.timestamp),
-                                               message.num.number,
-                                               message.num.description)
+    for message in Message.select(Message, Number).join(
+            Number, on=(Message.imsi == Number.imsi).alias('num')
+    ).order_by(Message.timestamp.desc()):
+        messages += '{0} [{1}] +7{2} | IMSI: {4} | Description: {3}\n'.format(
+            message.sender,
+            datetime.datetime.fromtimestamp(message.timestamp),
+            message.num.number,
+            message.num.description,
+            message.num.imsi
+        )
         messages += '{} \n'.format(message.content.encode('utf-8'))
         messages += '\n'
     return messages
+
+
+@app.route('/modem')
+def modems():
+    modem_str = ''
+    try:
+        for state_machine in state_machine_list:
+            network_info = state_machine.GetNetworkInfo()
+            # network codes to operators:
+            operator = 'unknown'
+            if network_info['NetworkCode'] == '250 01':
+                operator = 'MTS'
+            if network_info['NetworkCode'] == '250 02':
+                operator = 'MegaFon'
+            if network_info['NetworkCode'] == '250 99':
+                operator = 'Beeline'
+            if network_info['NetworkCode'] == '250 20':
+                operator = 'TELE2'
+            # network status
+            network_status = 'unknown'
+            if network_info['State'] == 'HomeNetwork':
+                network_status = 'online'
+            modem_str += 'IMEI: {}, SIM IMSI: {}, Status: {}, Device: {}, Operator: {}, Network: {}, LAC: {}, CID: {}'.format(
+                state_machine.GetIMEI(),
+                state_machine.GetSIMIMSI(),
+                network_status,
+                state_machine.GetConfig()['Device'],
+                operator,
+                network_info['NetworkCode'],
+                network_info['LAC'],
+                network_info['CID']
+                    )
+            modem_str += '\n'
+    except gammu.ERR_TIMEOUT:
+        return 'Modem timeout problem, please reload page'
+    return modem_str
 
 
 def main():
