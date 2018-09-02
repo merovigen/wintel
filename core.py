@@ -21,8 +21,9 @@ with open('config.json') as config_file:
     config = json.load(config_file)
 
 db = SqliteDatabase(config['db_file_path'].encode('utf8'))
+logging_level = logging.getLevelName(config['log_level'].encode('utf8'))
 logging.basicConfig(format='%(asctime)s %(levelname)-8s %(message)s',
-                    level=logging.INFO,
+                    level=logging_level,
                     filename=config['log_file_path'].encode('utf8'))
 state_machine_list = []
 
