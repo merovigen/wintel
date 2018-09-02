@@ -150,7 +150,7 @@ def __system_scan():
     # return modem_list
     modem_dict = {}
     for dev in os.listdir('/dev'):
-        if 'ttyUSB' in dev:
+        if 'ttyUSB' in dev and dev not in config['dev_exclude_list']:
             serial_port = serial.Serial(port='/dev/{}'.format(dev), baudrate=115200, bytesize=8, parity='N', stopbits=1,
                                         timeout=1, rtscts=False, dsrdtr=False)
             serial_port.write("AT\r\n")
