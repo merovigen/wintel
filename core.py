@@ -148,9 +148,11 @@ def __system_scan():
     #     if 'ttyUSB' in dev and int(re.search(r'ttyUSB(.*)', dev).group(1)) % 2 == 0:
     #         modem_list.append('/dev/'+dev)
     # return modem_list
+    logging.debug('Modem scan start')
     modem_dict = {}
     for dev in os.listdir('/dev'):
         if 'ttyUSB' in dev and dev not in config['dev_exclude_list']:
+            logging.debug('Trying to get {} IMEI'.format(dev))
             serial_port = serial.Serial(port='/dev/{}'.format(dev), baudrate=115200, bytesize=8, parity='N', stopbits=1,
                                         timeout=1, rtscts=False, dsrdtr=False)
             serial_port.write("AT\r\n")
